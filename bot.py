@@ -19,6 +19,7 @@ Telegram-бот для практики английского языка.
 """
 
 import os
+import re
 import random
 import logging
 import datetime as dt
@@ -81,6 +82,29 @@ def build_distractors(correct_index: int, count: int = 3) -> list:
 
 def normalize(text: str) -> str:
     return text.strip().lower().strip(".,!?")
+
+
+def acceptable_variants(word: dict) -> set:
+    """Собирает все допустимые варианты русского перевода: основные значения,
+    через запятую/слэш, содержимое в скобках отдельно и вручную заданные
+    синонимы (поле 'alt')."""
+    variants = set()
+    for part in word["ru"].split(","):
+        for piece in part.split("/"):
+            piece = piece.strip()
+            if not piece:
+                continue
+            variants.add(normalize(piece))
+            match = re.match(r"^(.*?)\s*\((.*?)\)\s*$", piece)
+            if match:
+                base, extra = match.group(1).strip(), match.group(2).strip()
+                if base:
+                    variants.add(normalize(base))
+                if extra:
+                    variants.add(normalize(extra))
+    for alt in word.get("alt", []):
+        variants.add(normalize(alt))
+    return variants
 
 
 def adjust_level(user: dict, session_correct: int, session_total: int) -> None:
@@ -259,8 +283,7 @@ async def handle_text_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_answer = normalize(update.message.text)
 
     if level == "medium":
-        variants = [normalize(v) for part in word["ru"].split(",") for v in part.split("/")]
-        is_correct = user_answer in variants
+        is_correct = user_answer in acceptable_variants(word)
         correct_text = word["ru"]
     else:  # hard (free text fallback)
         is_correct = user_answer == normalize(word["answer"])

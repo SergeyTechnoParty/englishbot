@@ -13,6 +13,7 @@ WORD_BANK = [
     {"en": "procurement", "ru": "закупки, снабжение", "category": "work",
      "sentence": "The ___ department approved the new budget.", "answer": "procurement"},
     {"en": "purchase order", "ru": "заказ на закупку", "category": "work",
+     "alt": ["заявка на покупку"],
      "sentence": "Please send the signed ___ to the vendor today.", "answer": "purchase order"},
     {"en": "invoice", "ru": "счёт-фактура", "category": "work",
      "sentence": "The accountant is waiting for the ___ before payment.", "answer": "invoice"},

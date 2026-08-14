@@ -54,23 +54,59 @@ SESSIONS = {}
 # Вспомогательные функции
 # ---------------------------------------------------------------------------
 
+def today_str() -> str:
+    return dt.date.today().isoformat()
+
+
+def get_due_word_indices(user: dict, limit: int) -> list:
+    """Слова, для которых наступил день повторения (или уже просрочен)."""
+    stats = user.get("word_stats", {})
+    today = today_str()
+    due = [int(idx) for idx, s in stats.items() if s.get("next_review", today) <= today]
+    due.sort(key=lambda i: stats[str(i)].get("next_review", today))
+    return due[:limit]
+
+
+def update_word_stat(user: dict, word_index: int, correct: bool) -> None:
+    """Обновляет 'карточную коробку' слова после ответа пользователя."""
+    stats = user.setdefault("word_stats", {})
+    key = str(word_index)
+    entry = stats.get(key, {"box": 0})
+    if correct:
+        entry["box"] = min(entry.get("box", 0) + 1, len(config.REVIEW_INTERVALS_DAYS))
+    else:
+        entry["box"] = 1
+    interval = config.REVIEW_INTERVALS_DAYS[entry["box"] - 1]
+    entry["next_review"] = (dt.date.today() + dt.timedelta(days=interval)).isoformat()
+    stats[key] = entry
+
+
 def pick_daily_words(user: dict) -> list:
-    """Выбирает WORDS_PER_SESSION слов: половина 'work', половина 'everyday',
-    последовательно по кругу, чтобы слова не повторялись слишком часто."""
-    work_words = [i for i, w in enumerate(WORD_BANK) if w["category"] == "work"]
-    everyday_words = [i for i, w in enumerate(WORD_BANK) if w["category"] == "everyday"]
+    """Сначала берёт слова, которые пора повторить (по интервальной системе),
+    затем добивает урок новыми словами, которые пользователь ещё не видел."""
+    limit = config.WORDS_PER_SESSION
+    chosen = get_due_word_indices(user, limit)
 
-    half = config.WORDS_PER_SESSION // 2
-    pointer = user.get("word_pointer", 0)
+    if len(chosen) < limit:
+        stats = user.get("word_stats", {})
+        seen = {int(k) for k in stats.keys()}
+        unseen = [i for i in range(len(WORD_BANK)) if i not in seen]
+        pointer = user.get("word_pointer", 0)
+        needed = limit - len(chosen)
 
-    def take(pool, count, start):
-        n = len(pool)
-        return [pool[(start + i) % n] for i in range(count)]
+        if unseen:
+            picks = [unseen[(pointer + i) % len(unseen)] for i in range(min(needed, len(unseen)))]
+            chosen.extend(picks)
+            user["word_pointer"] = pointer + len(picks)
+            needed -= len(picks)
 
-    chosen = take(work_words, half, pointer) + take(everyday_words, half, pointer)
+        if needed > 0:
+            candidates = [i for i in range(len(WORD_BANK)) if i not in chosen]
+            random.shuffle(candidates)
+            chosen.extend(candidates[:needed])
+
     random.shuffle(chosen)
-    user["word_pointer"] = pointer + half
-    return chosen
+    return chosen[:limit]
 
 
 def build_distractors(correct_index: int, count: int = 3) -> list:
@@ -81,7 +117,11 @@ def build_distractors(correct_index: int, count: int = 3) -> list:
 
 
 def normalize(text: str) -> str:
-    return text.strip().lower().strip(".,!?")
+    text = text.strip().lower().strip(".,!?")
+    text = text.replace("ё", "е")
+    text = re.sub(r"[-–—]", " ", text)  # дефис и пробел считаем эквивалентными
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
 
 def acceptable_variants(word: dict) -> set:
@@ -107,23 +147,30 @@ def acceptable_variants(word: dict) -> set:
     return variants
 
 
-def adjust_level(user: dict, session_correct: int, session_total: int) -> None:
-    """Обновляет историю ответов и, если нужно, меняет уровень сложности."""
+LEVEL_NAMES_RU = {"easy": "лёгкий", "medium": "средний", "hard": "сложный"}
+
+
+def adjust_level(user: dict, session_correct: int, session_total: int):
+    """Обновляет историю ответов. Если результаты слабые — тихо понижает
+    уровень. Если сильные — НЕ меняет уровень сама, а возвращает уровень,
+    который стоит предложить пользователю (спросить явно)."""
     history = user.get("history", [])
     history.extend([True] * session_correct + [False] * (session_total - session_correct))
     user["history"] = history[-20:]  # храним последние 20 ответов
 
     recent = user["history"][-10:]
     if len(recent) < 4:
-        return
+        return None
     accuracy = sum(recent) / len(recent)
 
     level = user.get("level", "medium")
     idx = config.LEVELS.index(level)
-    if accuracy >= 0.8 and idx < len(config.LEVELS) - 1:
-        user["level"] = config.LEVELS[idx + 1]
-    elif accuracy <= 0.4 and idx > 0:
+    if accuracy <= 0.4 and idx > 0:
         user["level"] = config.LEVELS[idx - 1]
+        return None
+    if accuracy >= 0.8 and idx < len(config.LEVELS) - 1:
+        return config.LEVELS[idx + 1]
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -170,13 +217,28 @@ async def send_next_question(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -
     session["current"] = word_index
     word = WORD_BANK[word_index]
     user = storage.get_user(chat_id)
+    stats = user.get("word_stats", {})
+
+    if str(word_index) not in stats:
+        # Слово встречается впервые — сначала показываем карточку с переводом
+        # и примером, без проверки. Отвечать по нему бот попросит в следующий раз.
+        example = word["sentence"].replace("___", f"**{word['answer']}**")
+        keyboard = [[InlineKeyboardButton("Понял, дальше →", callback_data=f"learn|{word_index}")]]
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"🆕 Новое слово:\n\n*{word['en']}* — {word['ru']}\n\n_{example}_",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
+
     level = user.get("level", "medium")
 
     if level == "easy":
         options = [word["ru"]] + build_distractors(word_index, 3)
         random.shuffle(options)
         keyboard = [
-            [InlineKeyboardButton(opt, callback_data=f"{word_index}|{opt}")]
+            [InlineKeyboardButton(opt, callback_data=f"quiz|{word_index}|{opt}")]
             for opt in options
         ]
         await context.bot.send_message(
@@ -210,16 +272,28 @@ async def finish_session(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> No
     correct, total = session["correct"], session["total"]
     user = storage.get_user(chat_id)
 
+    suggested_level = None
     if session["mode"] == "morning":
-        adjust_level(user, correct, total)
+        suggested_level = adjust_level(user, correct, total)
         user["streak"] = user.get("streak", 0) + 1
         storage.save_user(chat_id, user)
 
     percent = round(100 * correct / total) if total else 0
     await context.bot.send_message(
         chat_id=chat_id,
-        text=f"Урок завершён: {correct} из {total} правильных ({percent}%).",
+        text=f"🏁 Урок завершён: {correct} из {total} правильных ({percent}%).",
     )
+
+    if suggested_level:
+        keyboard = [[
+            InlineKeyboardButton(f"Да, перейти на {LEVEL_NAMES_RU[suggested_level]}", callback_data=f"setlevel|{suggested_level}"),
+            InlineKeyboardButton("Оставить как есть", callback_data="setlevel|keep"),
+        ]]
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Вы отлично справляетесь! Повысить уровень сложности?",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +314,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Команды:\n"
         "/word — получить слово вне расписания\n"
         "/status — ваш текущий уровень и статистика\n"
+        "/level — выбрать уровень сложности вручную\n"
         "/help — справка"
     )
 
@@ -253,10 +328,26 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = storage.get_user(chat_id)
     history = user.get("history", [])
     accuracy = round(100 * sum(history) / len(history)) if history else 0
+    due_count = len(get_due_word_indices(user, limit=len(WORD_BANK)))
+    learned_count = len(user.get("word_stats", {}))
     await update.message.reply_text(
-        f"Уровень сложности: {user.get('level', 'medium')}\n"
+        f"Уровень сложности: {LEVEL_NAMES_RU.get(user.get('level', 'medium'))}\n"
         f"Дней подряд с утренним уроком: {user.get('streak', 0)}\n"
-        f"Точность за последние {len(history)} ответов: {accuracy}%"
+        f"Точность за последние {len(history)} ответов: {accuracy}%\n"
+        f"Слов в изучении: {learned_count} из {len(WORD_BANK)}\n"
+        f"Ждут повторения сегодня: {due_count}"
+    )
+
+
+async def level_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    keyboard = [[
+        InlineKeyboardButton("Лёгкий", callback_data="setlevel|easy"),
+        InlineKeyboardButton("Средний", callback_data="setlevel|medium"),
+        InlineKeyboardButton("Сложный", callback_data="setlevel|hard"),
+    ]]
+    await update.message.reply_text(
+        "Выберите уровень сложности:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
 
@@ -277,8 +368,14 @@ async def handle_text_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("Сейчас нет активного вопроса. Пришлите /word, чтобы начать.")
         return
 
-    word = WORD_BANK[session["current"]]
     user = storage.get_user(chat_id)
+    if str(session["current"]) not in user.get("word_stats", {}):
+        await update.message.reply_text(
+            "Это новое слово — сначала нажмите кнопку «Понял, дальше →» под сообщением выше."
+        )
+        return
+
+    word = WORD_BANK[session["current"]]
     level = user.get("level", "medium")
     user_answer = normalize(update.message.text)
 
@@ -296,6 +393,9 @@ async def handle_text_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
     else:
         await update.message.reply_text(f"❌ Неверно. Правильный ответ: *{correct_text}*", parse_mode="Markdown")
 
+    update_word_stat(user, session["current"], is_correct)
+    storage.save_user(chat_id, user)
+
     session["current"] = None
     await send_next_question(chat_id, context)
 
@@ -305,19 +405,55 @@ async def handle_callback_answer(update: Update, context: ContextTypes.DEFAULT_T
     chat_id = query.message.chat_id
     await query.answer()
 
+    action, *rest = query.data.split("|")
+
+    if action == "setlevel":
+        new_level = rest[0]
+        if new_level == "keep":
+            await query.edit_message_text("Хорошо, оставляем текущий уровень.")
+            return
+        user = storage.get_user(chat_id)
+        user["level"] = new_level
+        storage.save_user(chat_id, user)
+        await query.edit_message_text(f"Уровень сложности изменён на: {LEVEL_NAMES_RU[new_level]}.")
+        return
+
     session = SESSIONS.get(chat_id)
     if not session or session["current"] is None:
         return
 
-    word_index_str, chosen_ru = query.data.split("|", 1)
+    if action == "learn":
+        # Пользователь ознакомился с новым словом — отмечаем его изученным
+        # (без учёта в счётчике правильных/неправильных) и переходим дальше.
+        word_index = int(rest[0])
+        user = storage.get_user(chat_id)
+        stats = user.setdefault("word_stats", {})
+        stats[str(word_index)] = {
+            "box": 1,
+            "next_review": (dt.date.today() + dt.timedelta(days=config.REVIEW_INTERVALS_DAYS[0])).isoformat(),
+        }
+        storage.save_user(chat_id, user)
+
+        await query.edit_message_reply_markup(reply_markup=None)
+        session["current"] = None
+        await send_next_question(chat_id, context)
+        return
+
+    # action == "quiz"
+    word_index_str, chosen_ru = rest
     word = WORD_BANK[session["current"]]
 
     session["total"] += 1
-    if chosen_ru == word["ru"]:
+    is_correct = chosen_ru == word["ru"]
+    if is_correct:
         session["correct"] += 1
         result_text = "✅ Верно!"
     else:
         result_text = f"❌ Неверно. Правильный ответ: {word['ru']}"
+
+    user = storage.get_user(chat_id)
+    update_word_stat(user, session["current"], is_correct)
+    storage.save_user(chat_id, user)
 
     await query.edit_message_reply_markup(reply_markup=None)
     await context.bot.send_message(chat_id=chat_id, text=result_text)
@@ -362,6 +498,7 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("level", level_command))
     application.add_handler(CommandHandler("word", word_now))
     application.add_handler(CallbackQueryHandler(handle_callback_answer))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_answer))

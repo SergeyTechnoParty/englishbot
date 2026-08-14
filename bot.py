@@ -24,7 +24,7 @@ import random
 import logging
 import datetime as dt
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -486,6 +486,21 @@ async def evening_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 # Запуск
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Меню команд Telegram (кнопка со списком рядом с полем ввода)
+# ---------------------------------------------------------------------------
+
+async def setup_commands_menu(application: Application) -> None:
+    commands = [
+        BotCommand("start", "Начать / как пользоваться ботом"),
+        BotCommand("word", "Получить слово прямо сейчас"),
+        BotCommand("status", "Мой уровень и статистика"),
+        BotCommand("level", "Выбрать уровень сложности"),
+        BotCommand("help", "Справка"),
+    ]
+    await application.bot.set_my_commands(commands)
+
+
 def main() -> None:
     if not BOT_TOKEN or BOT_TOKEN == "ВСТАВЬТЕ_СЮДА_СВОЙ_ТОКЕН":
         raise RuntimeError(
@@ -493,7 +508,7 @@ def main() -> None:
             "или впишите токен в BOT_TOKEN в этом файле."
         )
 
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = Application.builder().token(BOT_TOKEN).post_init(setup_commands_menu).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))

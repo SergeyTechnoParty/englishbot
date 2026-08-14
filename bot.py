@@ -221,12 +221,19 @@ async def send_next_question(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -
 
     if str(word_index) not in stats:
         # Слово встречается впервые — сначала показываем карточку с переводом
-        # и примером, без проверки. Отвечать по нему бот попросит в следующий раз.
-        example = word["sentence"].replace("___", f"**{word['answer']}**")
+        # и примером (+ перевод примера), без проверки. Отвечать по нему бот
+        # попросит в следующий раз.
+        example = word["sentence"].replace("___", f"*{word['answer']}*")
+        text = (
+            f"🆕 Новое слово:\n\n"
+            f"*{word['en']}* — {word['ru']}\n\n"
+            f"_{example}_\n"
+            f"{word['sentence_ru']}"
+        )
         keyboard = [[InlineKeyboardButton("Понял, дальше →", callback_data=f"learn|{word_index}")]]
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"🆕 Новое слово:\n\n*{word['en']}* — {word['ru']}\n\n_{example}_",
+            text=text,
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
@@ -282,6 +289,15 @@ async def finish_session(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> No
 
     correct, total = session["correct"], session["total"]
     user = storage.get_user(chat_id)
+
+    if total == 0:
+        # Например: /word попал на совершенно новое слово — проверки не было,
+        # было только знакомство с карточкой.
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="👍 Готово! Слово добавлено — увидите его на повторении, начиная с завтра.",
+        )
+        return
 
     suggested_level = None
     if session["mode"] == "morning":

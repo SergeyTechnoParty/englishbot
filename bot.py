@@ -269,6 +269,17 @@ async def finish_session(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> No
     if not session:
         return
 
+    if session["mode"] == "learn_new":
+        count = session.get("new_count", 0)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"📚 Отлично! Вы познакомились с {count} новыми словами.\n"
+                "Начиная с завтра они будут появляться на повторении в обычных уроках."
+            ),
+        )
+        return
+
     correct, total = session["correct"], session["total"]
     user = storage.get_user(chat_id)
 
@@ -312,7 +323,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Уровень сложности (лёгкий/средний/сложный) я буду подбирать сам, "
         "по вашим результатам.\n\n"
         "Команды:\n"
-        "/word — получить слово вне расписания\n"
+        "/learn — изучить пачку новых слов, когда есть свободное время\n"
+        "/word — потренироваться на 1 слове вне расписания\n"
         "/status — ваш текущий уровень и статистика\n"
         "/level — выбрать уровень сложности вручную\n"
         "/help — справка"
@@ -358,6 +370,39 @@ async def word_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     word_index = random.randrange(len(WORD_BANK))
     SESSIONS[chat_id] = {"queue": [word_index], "correct": 0, "total": 0, "mode": "practice", "current": None}
+    await send_next_question(chat_id, context)
+
+
+async def learn_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    if chat_id in SESSIONS:
+        await update.message.reply_text("Урок уже идёт — просто ответьте на текущий вопрос.")
+        return
+
+    user = storage.get_user(chat_id)
+    stats = user.get("word_stats", {})
+    seen = {int(k) for k in stats.keys()}
+    unseen = [i for i in range(len(WORD_BANK)) if i not in seen]
+
+    if not unseen:
+        await update.message.reply_text("🎉 Вы уже познакомились со всеми словами из базы! Загляните в /status.")
+        return
+
+    pointer = user.get("word_pointer", 0)
+    count = min(config.WORDS_PER_SESSION, len(unseen))
+    picks = [unseen[(pointer + i) % len(unseen)] for i in range(count)]
+    user["word_pointer"] = pointer + count
+    storage.save_user(chat_id, user)
+
+    await update.message.reply_text(f"📚 Новые слова для знакомства: {count}. Поехали!")
+    SESSIONS[chat_id] = {
+        "queue": picks,
+        "correct": 0,
+        "total": 0,
+        "mode": "learn_new",
+        "current": None,
+        "new_count": count,
+    }
     await send_next_question(chat_id, context)
 
 
@@ -493,7 +538,8 @@ async def evening_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 async def setup_commands_menu(application: Application) -> None:
     commands = [
         BotCommand("start", "Начать / как пользоваться ботом"),
-        BotCommand("word", "Получить слово прямо сейчас"),
+        BotCommand("learn", "Изучить новые слова (когда есть время)"),
+        BotCommand("word", "Потренироваться на 1 слове прямо сейчас"),
         BotCommand("status", "Мой уровень и статистика"),
         BotCommand("level", "Выбрать уровень сложности"),
         BotCommand("help", "Справка"),
@@ -515,6 +561,7 @@ def main() -> None:
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("level", level_command))
     application.add_handler(CommandHandler("word", word_now))
+    application.add_handler(CommandHandler("learn", learn_new))
     application.add_handler(CallbackQueryHandler(handle_callback_answer))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_answer))
 
